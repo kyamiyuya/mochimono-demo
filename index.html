@@ -37,14 +37,14 @@
     .conf{font-size:12px;color:#b7c3d6}
     .time{font-size:11px;color:#8aa0c5}
     .footerNote{font-size:11px;color:#9aa4b2;line-height:1.5}
-    a{color:#93c5fd}
+    code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:8px}
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>持ち物AIデモ（Phase1）</h1>
-      <div class="tag">カメラ映像 → 物体検出 → 枠表示 → リスト化（端末内処理）</div>
+      <div class="tag">カメラ映像 → 中央だけ検出（ROI） → 枠表示 → リスト化（端末内処理）</div>
     </div>
     <div class="tag">AI: TensorFlow.js（無料）</div>
   </header>
@@ -60,7 +60,7 @@
           <button id="btnClear" class="danger" disabled>結果クリア</button>
         </div>
         <div class="hint" style="margin-top:8px">
-          ※iPad/スマホは<strong>HTTPS</strong>のページでないとカメラが使えません（GitHub Pages推奨）。
+          ※iPad/スマホは<strong>HTTPS</strong>でないとカメラが使えません（GitHub Pages）。
         </div>
 
         <div class="videoWrap" style="margin-top:12px">
@@ -70,13 +70,13 @@
 
         <div class="stat">
           <div class="pill" id="modelState">モデル: 未読込</div>
-          <div class="pill good" id="privacy">画像送信: なし（端末内処理）</div>
-          <div class="pill" id="fps">推論間隔: 1000ms</div>
+          <div class="pill good">画像送信: なし（端末内処理）</div>
+          <div class="pill" id="fps">推論間隔: -</div>
         </div>
 
         <div class="footerNote" style="margin-top:10px">
-          ・検出モデルはCOCO-SSD（80種）です。日用品でも「bottle」「backpack」「handbag」など英語名で出ます。<br/>
-          ・次フェーズでは「動画録画→フレーム抽出→重複統合→持ち物リスト保存」を追加します。
+          ・このデモは「画面中央の点線枠」内だけを検出します（負荷軽減）。<br/>
+          ・ラベルは一部を日本語化しています（辞書に無いものは英語のまま）。
         </div>
       </div>
     </section>
@@ -87,7 +87,7 @@
         <div class="hint">同じ物体名は短時間はまとめます（重複抑制）。</div>
         <div id="list" class="list" style="margin-top:10px"></div>
         <div class="footerNote" style="margin-top:10px">
-          公開後のURL例：<code>https://kyamiyuya.github.io/mochimono-demo/</code>
+          公開URL：<code>https://kyamiyuya.github.io/mochimono-demo/</code>
         </div>
       </div>
     </aside>
@@ -112,15 +112,52 @@
 
     let stream = null;
     let model = null;
-    let running = false;
     let timer = null;
 
-    const DETECT_EVERY_MS = 1800;
-els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
+    // ★負荷調整：推論間隔（長いほど軽い）
+    const DETECT_EVERY_MS = 2000;
+    els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms`;
+
+    // ★中央ROI：画面中央60%×60%のみ検出
+    const ROI_SCALE = 0.60;
+
+    // ★検出閾値
+    const MIN_SCORE = 0.55;
 
     // 重複抑制（同じクラスは一定時間以内は更新のみ）
-    const lastSeen = new Map(); // className -> {t, conf, thumb}
+    const lastSeen = new Map();
     const DEDUPE_MS = 4000;
+
+    // COCO-SSD 英語→日本語（必要に応じて追加できます）
+    const JP_LABEL = {
+      'person':'人',
+      'bottle':'ボトル',
+      'cup':'コップ',
+      'backpack':'リュック',
+      'handbag':'バッグ',
+      'suitcase':'スーツケース',
+      'book':'本',
+      'cell phone':'携帯電話',
+      'toothbrush':'歯ブラシ',
+      'tie':'ネクタイ',
+      'umbrella':'傘',
+      'remote':'リモコン',
+      'keyboard':'キーボード',
+      'mouse':'マウス',
+      'laptop':'ノートPC',
+      'tv':'テレビ',
+      'chair':'椅子',
+      'couch':'ソファ',
+      'bed':'ベッド',
+      'dining table':'テーブル',
+      'refrigerator':'冷蔵庫',
+      'scissors':'はさみ',
+      'bowl':'ボウル',
+      'fork':'フォーク',
+      'knife':'ナイフ',
+      'spoon':'スプーン'
+    };
+    function toJP(label){ return JP_LABEL[label] || label; }
 
     function nowStr(){
       const d=new Date();
@@ -134,6 +171,34 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
       c.height = Math.floor(rect.height * devicePixelRatio);
     }
 
+    function getRoiRect(){
+      const rect = els.video.getBoundingClientRect();
+      const w = rect.width * ROI_SCALE;
+      const h = rect.height * ROI_SCALE;
+      return { x:(rect.width-w)/2, y:(rect.height-h)/2, w, h, rect };
+    }
+
+    function drawRoiFrame(){
+      const ctx = els.overlay.getContext('2d');
+      ctx.save();
+      ctx.scale(devicePixelRatio, devicePixelRatio);
+
+      // ROI枠だけ描く場合はクリアしない（boxes描画時は別でクリア）
+      const roi = getRoiRect();
+      ctx.strokeStyle = 'rgba(147,197,253,0.95)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6,4]);
+      ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.font = '12px system-ui';
+      ctx.fillText('検出エリア（中央）', roi.x+6, Math.max(14, roi.y-6));
+      ctx.restore();
+    }
+
+    window.addEventListener('resize', ()=>{ resizeCanvas(); });
+
     async function loadModel(){
       if(model) return model;
       els.modelState.textContent = 'モデル: 読込中…（初回は30〜90秒かかる場合があります）';
@@ -143,7 +208,6 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
     }
 
     async function startCamera(){
-      // 背面カメラ優先
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' } },
         audio: false
@@ -151,16 +215,12 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
       els.video.srcObject = stream;
       await els.video.play();
       resizeCanvas();
+      // 初期表示：ROI枠を表示
+      const ctx = els.overlay.getContext('2d');
+      ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
       drawRoiFrame();
       els.btnStart.disabled = false;
       els.btnClear.disabled = false;
-    }
-
-    function stopCamera(){
-      if(stream){
-        stream.getTracks().forEach(t=>t.stop());
-        stream=null;
-      }
     }
 
     function clearResults(){
@@ -168,8 +228,8 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
       els.list.innerHTML='';
       const ctx = els.overlay.getContext('2d');
       ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
+      if(stream) drawRoiFrame();
     }
-    if(stream){ try{ drawRoiFrame(); }catch(e){} }
 
     function draw(predictions){
       const ctx = els.overlay.getContext('2d');
@@ -185,18 +245,15 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
       ctx.font = '12px system-ui';
 
       predictions.forEach(p=>{
-        const [x,y,w,h] = p.bbox;
-        const sx = x*scaleX;
-        const sy = y*scaleY;
-        const sw = w*scaleX;
-        const sh = h*scaleY;
+        const [x,y,w,h] = p.bbox; // video座標
+        const sx = x*scaleX, sy = y*scaleY, sw = w*scaleX, sh = h*scaleY;
 
         ctx.strokeStyle = 'rgba(16,185,129,0.95)';
         ctx.fillStyle = 'rgba(16,185,129,0.18)';
         ctx.strokeRect(sx,sy,sw,sh);
         ctx.fillRect(sx,sy,sw,sh);
 
-        const label = `${toJP(p.class)} ${(p.score*100).toFixed(0)}%`; // 日本語表示
+        const label = `${toJP(p.class)} ${(p.score*100).toFixed(0)}%`;
         ctx.fillStyle = 'rgba(0,0,0,0.65)';
         const tw = ctx.measureText(label).width + 8;
         ctx.fillRect(sx, Math.max(0,sy-18), tw, 18);
@@ -204,21 +261,19 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
         ctx.fillText(label, sx+4, Math.max(12,sy-6));
       });
 
-      // ROI枠を重ねる
-      try{ drawRoiFrame(); }catch(e){}
+      // 最後にROI枠を重ねる
+      drawRoiFrame();
       ctx.restore();
     }
 
     function cropThumb(p){
-      // video座標系からcrop
       const v = els.video;
       const [x,y,w,h] = p.bbox;
       const c = document.createElement('canvas');
       const ctx = c.getContext('2d');
       const cw = Math.max(1, Math.floor(w));
       const ch = Math.max(1, Math.floor(h));
-      c.width = cw;
-      c.height = ch;
+      c.width = cw; c.height = ch;
       ctx.drawImage(v, x, y, w, h, 0, 0, cw, ch);
       return c.toDataURL('image/jpeg', 0.75);
     }
@@ -230,7 +285,6 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
       const old = lastSeen.get(key);
 
       if(old && (t - old.t) < DEDUPE_MS){
-        // update
         lastSeen.set(key, {t, conf:p.score, thumb});
         const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
         if(el){
@@ -264,55 +318,60 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
     }
 
     async function detectOnce(){
-  if(!model || !els.video.videoWidth) return;
+      if(!model || !els.video.videoWidth) return;
 
-  // 画面中央ROIのみを切り出して検出（軽量化）
-  const roi = getRoiRect();
-  const sx = els.video.videoWidth / roi.rect.width;
-  const sy = els.video.videoHeight / roi.rect.height;
+      // 画面中央ROIのみを切り出して検出（軽量化）
+      const roi = getRoiRect();
 
-  const srcX = roi.x * sx;
-  const srcY = roi.y * sy;
-  const srcW = roi.w * sx;
-  const srcH = roi.h * sy;
+      // 表示座標 -> video座標へ変換
+      const sx = els.video.videoWidth / roi.rect.width;
+      const sy = els.video.videoHeight / roi.rect.height;
 
-  const roiCanvas = document.createElement('canvas');
-  roiCanvas.width = Math.max(1, Math.floor(srcW));
-  roiCanvas.height = Math.max(1, Math.floor(srcH));
-  const rctx = roiCanvas.getContext('2d');
-  rctx.drawImage(els.video, srcX, srcY, srcW, srcH, 0, 0, roiCanvas.width, roiCanvas.height);
+      const srcX = roi.x * sx;
+      const srcY = roi.y * sy;
+      const srcW = roi.w * sx;
+      const srcH = roi.h * sy;
 
-  const preds = await model.detect(roiCanvas);
-  const filtered = preds
-    .filter(p=>p.score >= MIN_SCORE)
-    .map(p=>({
-      ...p,
+      const roiCanvas = document.createElement('canvas');
+      roiCanvas.width = Math.max(1, Math.floor(srcW));
+      roiCanvas.height = Math.max(1, Math.floor(srcH));
+      const rctx = roiCanvas.getContext('2d');
+      rctx.drawImage(els.video, srcX, srcY, srcW, srcH, 0, 0, roiCanvas.width, roiCanvas.height);
+
+      const preds = await model.detect(roiCanvas);
+
       // ROI内座標 -> 元動画座標へ戻す
-      bbox: [p.bbox[0] + srcX, p.bbox[1] + srcY, p.bbox[2], p.bbox[3]]
-    }));
+      const filtered = preds
+        .filter(p=>p.score >= MIN_SCORE)
+        .map(p=>({
+          ...p,
+          bbox: [p.bbox[0] + srcX, p.bbox[1] + srcY, p.bbox[2], p.bbox[3]]
+        }));
 
-  draw(filtered);
+      draw(filtered);
 
-  filtered.slice(0,6).forEach(p=>{
-    let thumb=null;
-    try{ thumb = cropThumb(p); }catch(e){}
-    upsertList(p, thumb);
-  });
-}
+      filtered.slice(0,6).forEach(p=>{
+        let thumb=null;
+        try{ thumb = cropThumb(p); }catch(e){}
+        upsertList(p, thumb);
+      });
+    }
 
     async function startDetect(){
       await loadModel();
-      running = true;
       els.btnStart.disabled = true;
       els.btnStop.disabled = false;
       timer = setInterval(detectOnce, DETECT_EVERY_MS);
     }
 
     function stopDetect(){
-      running = false;
       els.btnStart.disabled = !stream;
       els.btnStop.disabled = true;
       if(timer){ clearInterval(timer); timer=null; }
+      // 停止時もROI枠は表示
+      const ctx = els.overlay.getContext('2d');
+      ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
+      if(stream) drawRoiFrame();
     }
 
     // PWA: SW登録
@@ -328,7 +387,7 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
         await startCamera();
         els.btnCam.textContent = 'カメラ起動中';
       }catch(err){
-        alert('カメラ起動に失敗しました。HTTPSのページで開いているか、カメラ許可がONか確認してください。');
+        alert('カメラ起動に失敗しました。HTTPSで開いているか、カメラ許可がONか確認してください。');
         els.btnCam.disabled = false;
       }
     });
@@ -336,8 +395,6 @@ els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
     els.btnStart.addEventListener('click', startDetect);
     els.btnStop.addEventListener('click', stopDetect);
     els.btnClear.addEventListener('click', clearResults);
-
-    window.addEventListener('beforeunload', ()=>{ stopDetect(); stopCamera(); });
   </script>
 </body>
 </html>
