@@ -115,8 +115,8 @@
     let running = false;
     let timer = null;
 
-    const DETECT_EVERY_MS = 1000;
-    els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms`;
+    const DETECT_EVERY_MS = 1800;
+els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms（調整予定）`;
 
     // 重複抑制（同じクラスは一定時間以内は更新のみ）
     const lastSeen = new Map(); // className -> {t, conf, thumb}
@@ -134,11 +134,9 @@
       c.height = Math.floor(rect.height * devicePixelRatio);
     }
 
-    window.addEventListener('resize', resizeCanvas);
-
     async function loadModel(){
       if(model) return model;
-      els.modelState.textContent = 'モデル: 読込中…';
+      els.modelState.textContent = 'モデル: 読込中…（初回は30〜90秒かかる場合があります）';
       model = await cocoSsd.load();
       els.modelState.textContent = 'モデル: 準備OK';
       return model;
@@ -153,6 +151,7 @@
       els.video.srcObject = stream;
       await els.video.play();
       resizeCanvas();
+      drawRoiFrame();
       els.btnStart.disabled = false;
       els.btnClear.disabled = false;
     }
@@ -170,6 +169,7 @@
       const ctx = els.overlay.getContext('2d');
       ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
     }
+    if(stream){ try{ drawRoiFrame(); }catch(e){} }
 
     function draw(predictions){
       const ctx = els.overlay.getContext('2d');
@@ -196,7 +196,7 @@
         ctx.strokeRect(sx,sy,sw,sh);
         ctx.fillRect(sx,sy,sw,sh);
 
-        const label = `${p.class} ${(p.score*100).toFixed(0)}%`;
+        const label = `${toJP(p.class)} ${(p.score*100).toFixed(0)}%`; // 日本語表示
         ctx.fillStyle = 'rgba(0,0,0,0.65)';
         const tw = ctx.measureText(label).width + 8;
         ctx.fillRect(sx, Math.max(0,sy-18), tw, 18);
@@ -204,6 +204,8 @@
         ctx.fillText(label, sx+4, Math.max(12,sy-6));
       });
 
+      // ROI枠を重ねる
+      try{ drawRoiFrame(); }catch(e){}
       ctx.restore();
     }
 
@@ -223,6 +225,7 @@
 
     function upsertList(p, thumb){
       const key = p.class;
+      const displayName = toJP(p.class);
       const t = Date.now();
       const old = lastSeen.get(key);
 
@@ -233,6 +236,7 @@
         if(el){
           el.querySelector('.conf').textContent = `${(p.score*100).toFixed(0)}%`;
           el.querySelector('.time').textContent = `更新: ${nowStr()}`;
+          el.querySelector('.name').textContent = displayName;
           if(thumb) el.querySelector('img').src = thumb;
         }
         return;
@@ -252,7 +256,7 @@
           <div class="time"></div>
         </div>
       `;
-      item.querySelector('.name').textContent = p.class;
+      item.querySelector('.name').textContent = displayName;
       item.querySelector('.conf').textContent = `${(p.score*100).toFixed(0)}%`;
       item.querySelector('.time').textContent = `検出: ${nowStr()}`;
       item.querySelector('img').src = thumb || '';
@@ -260,17 +264,41 @@
     }
 
     async function detectOnce(){
-      if(!model || !els.video.videoWidth) return;
-      const preds = await model.detect(els.video);
-      // ある程度のスコアでフィルタ
-      const filtered = preds.filter(p=>p.score >= 0.55);
-      draw(filtered);
-      filtered.slice(0,6).forEach(p=>{
-        let thumb = null;
-        try{ thumb = cropThumb(p); }catch(e){}
-        upsertList(p, thumb);
-      });
-    }
+  if(!model || !els.video.videoWidth) return;
+
+  // 画面中央ROIのみを切り出して検出（軽量化）
+  const roi = getRoiRect();
+  const sx = els.video.videoWidth / roi.rect.width;
+  const sy = els.video.videoHeight / roi.rect.height;
+
+  const srcX = roi.x * sx;
+  const srcY = roi.y * sy;
+  const srcW = roi.w * sx;
+  const srcH = roi.h * sy;
+
+  const roiCanvas = document.createElement('canvas');
+  roiCanvas.width = Math.max(1, Math.floor(srcW));
+  roiCanvas.height = Math.max(1, Math.floor(srcH));
+  const rctx = roiCanvas.getContext('2d');
+  rctx.drawImage(els.video, srcX, srcY, srcW, srcH, 0, 0, roiCanvas.width, roiCanvas.height);
+
+  const preds = await model.detect(roiCanvas);
+  const filtered = preds
+    .filter(p=>p.score >= MIN_SCORE)
+    .map(p=>({
+      ...p,
+      // ROI内座標 -> 元動画座標へ戻す
+      bbox: [p.bbox[0] + srcX, p.bbox[1] + srcY, p.bbox[2], p.bbox[3]]
+    }));
+
+  draw(filtered);
+
+  filtered.slice(0,6).forEach(p=>{
+    let thumb=null;
+    try{ thumb = cropThumb(p); }catch(e){}
+    upsertList(p, thumb);
+  });
+}
 
     async function startDetect(){
       await loadModel();
