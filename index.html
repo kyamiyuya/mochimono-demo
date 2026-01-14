@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>持ち物AIデモ（Phase1）</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#2563EB" />
+  <style>
+    :root{--b:#2563EB;--g:#10B981;--bg:#0b1220;--card:#111a2e;--mut:#9aa4b2;}
+    body{font-family:system-ui,-apple-system,"Hiragino Sans","Yu Gothic",sans-serif;margin:0;background:#0b1220;color:#e7eefc;}
+    header{padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;gap:12px;align-items:center;justify-content:space-between;}
+    header h1{font-size:16px;margin:0;font-weight:700;}
+    header .tag{font-size:12px;color:#b7c3d6}
+    main{padding:14px;display:grid;gap:14px;grid-template-columns:1.2fr .8fr;}
+    @media (max-width: 900px){main{grid-template-columns:1fr;}}
+    .card{background:#111a2e;border:1px solid rgba(255,255,255,.08);border-radius:12px;overflow:hidden;}
+    .card h2{font-size:13px;margin:0;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);color:#cfe0ff;}
+    .pad{padding:12px;}
+    button{background:var(--b);border:none;color:white;padding:10px 12px;border-radius:10px;font-weight:700;cursor:pointer;}
+    button.secondary{background:#243252}
+    button.danger{background:#b91c1c}
+    button:disabled{opacity:.55;cursor:not-allowed}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .hint{font-size:12px;color:var(--mut)}
+    .videoWrap{position:relative;background:black;aspect-ratio:16/9;}
+    video,canvas{position:absolute;inset:0;width:100%;height:100%;}
+    canvas{pointer-events:none;}
+    .stat{display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap}
+    .pill{font-size:12px;background:rgba(37,99,235,.18);border:1px solid rgba(37,99,235,.35);padding:6px 10px;border-radius:999px}
+    .pill.good{background:rgba(16,185,129,.15);border-color:rgba(16,185,129,.35)}
+    .list{display:grid;gap:8px}
+    .item{display:grid;grid-template-columns:56px 1fr;gap:10px;align-items:center;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:8px}
+    .thumb{width:56px;height:56px;border-radius:10px;background:#0b1220;object-fit:cover;border:1px solid rgba(255,255,255,.08)}
+    .meta{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+    .name{font-weight:800}
+    .conf{font-size:12px;color:#b7c3d6}
+    .time{font-size:11px;color:#8aa0c5}
+    .footerNote{font-size:11px;color:#9aa4b2;line-height:1.5}
+    a{color:#93c5fd}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>持ち物AIデモ（Phase1）</h1>
+      <div class="tag">カメラ映像 → 物体検出 → 枠表示 → リスト化（端末内処理）</div>
+    </div>
+    <div class="tag">AI: TensorFlow.js（無料）</div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1) カメラ & 検出</h2>
+      <div class="pad">
+        <div class="row">
+          <button id="btnCam">カメラ開始</button>
+          <button id="btnStart" class="secondary" disabled>検出開始</button>
+          <button id="btnStop" class="secondary" disabled>検出停止</button>
+          <button id="btnClear" class="danger" disabled>結果クリア</button>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          ※iPad/スマホは<strong>HTTPS</strong>のページでないとカメラが使えません（GitHub Pages推奨）。
+        </div>
+
+        <div class="videoWrap" style="margin-top:12px">
+          <video id="video" playsinline muted></video>
+          <canvas id="overlay"></canvas>
+        </div>
+
+        <div class="stat">
+          <div class="pill" id="modelState">モデル: 未読込</div>
+          <div class="pill good" id="privacy">画像送信: なし（端末内処理）</div>
+          <div class="pill" id="fps">推論間隔: 1000ms</div>
+        </div>
+
+        <div class="footerNote" style="margin-top:10px">
+          ・検出モデルはCOCO-SSD（80種）です。日用品でも「bottle」「backpack」「handbag」など英語名で出ます。<br/>
+          ・次フェーズでは「動画録画→フレーム抽出→重複統合→持ち物リスト保存」を追加します。
+        </div>
+      </div>
+    </section>
+
+    <aside class="card">
+      <h2>2) 検出結果（リスト）</h2>
+      <div class="pad">
+        <div class="hint">同じ物体名は短時間はまとめます（重複抑制）。</div>
+        <div id="list" class="list" style="margin-top:10px"></div>
+        <div class="footerNote" style="margin-top:10px">
+          公開後のURL例：<code>https://kyamiyuya.github.io/mochimono-demo/</code>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- TensorFlow.js & COCO-SSD (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+
+  <script>
+    const els = {
+      btnCam: document.getElementById('btnCam'),
+      btnStart: document.getElementById('btnStart'),
+      btnStop: document.getElementById('btnStop'),
+      btnClear: document.getElementById('btnClear'),
+      video: document.getElementById('video'),
+      overlay: document.getElementById('overlay'),
+      list: document.getElementById('list'),
+      modelState: document.getElementById('modelState'),
+      fps: document.getElementById('fps'),
+    };
+
+    let stream = null;
+    let model = null;
+    let running = false;
+    let timer = null;
+
+    const DETECT_EVERY_MS = 1000;
+    els.fps.textContent = `推論間隔: ${DETECT_EVERY_MS}ms`;
+
+    // 重複抑制（同じクラスは一定時間以内は更新のみ）
+    const lastSeen = new Map(); // className -> {t, conf, thumb}
+    const DEDUPE_MS = 4000;
+
+    function nowStr(){
+      const d=new Date();
+      return d.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    }
+
+    function resizeCanvas(){
+      const rect = els.video.getBoundingClientRect();
+      const c = els.overlay;
+      c.width = Math.floor(rect.width * devicePixelRatio);
+      c.height = Math.floor(rect.height * devicePixelRatio);
+    }
+
+    window.addEventListener('resize', resizeCanvas);
+
+    async function loadModel(){
+      if(model) return model;
+      els.modelState.textContent = 'モデル: 読込中…';
+      model = await cocoSsd.load();
+      els.modelState.textContent = 'モデル: 準備OK';
+      return model;
+    }
+
+    async function startCamera(){
+      // 背面カメラ優先
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false
+      });
+      els.video.srcObject = stream;
+      await els.video.play();
+      resizeCanvas();
+      els.btnStart.disabled = false;
+      els.btnClear.disabled = false;
+    }
+
+    function stopCamera(){
+      if(stream){
+        stream.getTracks().forEach(t=>t.stop());
+        stream=null;
+      }
+    }
+
+    function clearResults(){
+      lastSeen.clear();
+      els.list.innerHTML='';
+      const ctx = els.overlay.getContext('2d');
+      ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
+    }
+
+    function draw(predictions){
+      const ctx = els.overlay.getContext('2d');
+      ctx.save();
+      ctx.scale(devicePixelRatio, devicePixelRatio);
+      ctx.clearRect(0,0,els.overlay.width, els.overlay.height);
+
+      const vRect = els.video.getBoundingClientRect();
+      const scaleX = vRect.width / els.video.videoWidth;
+      const scaleY = vRect.height / els.video.videoHeight;
+
+      ctx.lineWidth = 2;
+      ctx.font = '12px system-ui';
+
+      predictions.forEach(p=>{
+        const [x,y,w,h] = p.bbox;
+        const sx = x*scaleX;
+        const sy = y*scaleY;
+        const sw = w*scaleX;
+        const sh = h*scaleY;
+
+        ctx.strokeStyle = 'rgba(16,185,129,0.95)';
+        ctx.fillStyle = 'rgba(16,185,129,0.18)';
+        ctx.strokeRect(sx,sy,sw,sh);
+        ctx.fillRect(sx,sy,sw,sh);
+
+        const label = `${p.class} ${(p.score*100).toFixed(0)}%`;
+        ctx.fillStyle = 'rgba(0,0,0,0.65)';
+        const tw = ctx.measureText(label).width + 8;
+        ctx.fillRect(sx, Math.max(0,sy-18), tw, 18);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, sx+4, Math.max(12,sy-6));
+      });
+
+      ctx.restore();
+    }
+
+    function cropThumb(p){
+      // video座標系からcrop
+      const v = els.video;
+      const [x,y,w,h] = p.bbox;
+      const c = document.createElement('canvas');
+      const ctx = c.getContext('2d');
+      const cw = Math.max(1, Math.floor(w));
+      const ch = Math.max(1, Math.floor(h));
+      c.width = cw;
+      c.height = ch;
+      ctx.drawImage(v, x, y, w, h, 0, 0, cw, ch);
+      return c.toDataURL('image/jpeg', 0.75);
+    }
+
+    function upsertList(p, thumb){
+      const key = p.class;
+      const t = Date.now();
+      const old = lastSeen.get(key);
+
+      if(old && (t - old.t) < DEDUPE_MS){
+        // update
+        lastSeen.set(key, {t, conf:p.score, thumb});
+        const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+        if(el){
+          el.querySelector('.conf').textContent = `${(p.score*100).toFixed(0)}%`;
+          el.querySelector('.time').textContent = `更新: ${nowStr()}`;
+          if(thumb) el.querySelector('img').src = thumb;
+        }
+        return;
+      }
+
+      lastSeen.set(key, {t, conf:p.score, thumb});
+      const item = document.createElement('div');
+      item.className='item';
+      item.dataset.key = key;
+      item.innerHTML = `
+        <img class="thumb" alt="thumb" />
+        <div>
+          <div class="meta">
+            <div class="name"></div>
+            <div class="conf"></div>
+          </div>
+          <div class="time"></div>
+        </div>
+      `;
+      item.querySelector('.name').textContent = p.class;
+      item.querySelector('.conf').textContent = `${(p.score*100).toFixed(0)}%`;
+      item.querySelector('.time').textContent = `検出: ${nowStr()}`;
+      item.querySelector('img').src = thumb || '';
+      els.list.prepend(item);
+    }
+
+    async function detectOnce(){
+      if(!model || !els.video.videoWidth) return;
+      const preds = await model.detect(els.video);
+      // ある程度のスコアでフィルタ
+      const filtered = preds.filter(p=>p.score >= 0.55);
+      draw(filtered);
+      filtered.slice(0,6).forEach(p=>{
+        let thumb = null;
+        try{ thumb = cropThumb(p); }catch(e){}
+        upsertList(p, thumb);
+      });
+    }
+
+    async function startDetect(){
+      await loadModel();
+      running = true;
+      els.btnStart.disabled = true;
+      els.btnStop.disabled = false;
+      timer = setInterval(detectOnce, DETECT_EVERY_MS);
+    }
+
+    function stopDetect(){
+      running = false;
+      els.btnStart.disabled = !stream;
+      els.btnStop.disabled = true;
+      if(timer){ clearInterval(timer); timer=null; }
+    }
+
+    // PWA: SW登録
+    if('serviceWorker' in navigator){
+      window.addEventListener('load', ()=>{
+        navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
+      });
+    }
+
+    els.btnCam.addEventListener('click', async ()=>{
+      try{
+        els.btnCam.disabled = true;
+        await startCamera();
+        els.btnCam.textContent = 'カメラ起動中';
+      }catch(err){
+        alert('カメラ起動に失敗しました。HTTPSのページで開いているか、カメラ許可がONか確認してください。');
+        els.btnCam.disabled = false;
+      }
+    });
+
+    els.btnStart.addEventListener('click', startDetect);
+    els.btnStop.addEventListener('click', stopDetect);
+    els.btnClear.addEventListener('click', clearResults);
+
+    window.addEventListener('beforeunload', ()=>{ stopDetect(); stopCamera(); });
+  </script>
+</body>
+</html>
